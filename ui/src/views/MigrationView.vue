@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import axios from 'axios'
 import PolicySelect from '../components/PolicySelect.vue'
+import StorageMigratorIcon from '../components/StorageMigratorIcon.vue'
 
 interface PolicyVo {
   name: string
@@ -434,7 +435,10 @@ onUnmounted(stopPolling)
 <template>
   <div class="sm-page">
     <header class="sm-header">
-      <h1 class="sm-header__title">存储策略迁移</h1>
+      <div class="sm-header__titlebar">
+        <StorageMigratorIcon class="sm-header__icon" :size="22" />
+        <h1 class="sm-header__title">存储策略迁移</h1>
+      </div>
       <p class="sm-header__desc">
         把附件从一个存储策略搬运到另一个存储策略，并自动改写文章、独立页面、瞬间、评论、用户头像、主题配置与系统设置中引用旧地址的链接。
       </p>
@@ -711,6 +715,17 @@ onUnmounted(stopPolling)
 
 .sm-header {
   margin-bottom: 16px;
+}
+
+.sm-header__titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sm-header__icon {
+  flex: none;
+  color: #2563eb;
 }
 
 .sm-header__title {

@@ -1,6 +1,6 @@
 import { definePlugin } from '@halo-dev/ui-shared'
-import { IconPlug } from '@halo-dev/components'
 import { markRaw } from 'vue'
+import StorageMigratorIcon from './components/StorageMigratorIcon.vue'
 
 export default definePlugin({
   components: {},
@@ -17,7 +17,7 @@ export default definePlugin({
           menu: {
             name: '存储策略迁移',
             group: 'tool',
-            icon: markRaw(IconPlug),
+            icon: markRaw(StorageMigratorIcon),
             priority: 0,
           },
         },
