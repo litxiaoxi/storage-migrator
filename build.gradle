@@ -39,6 +39,10 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.named('generatePluginComponentsIdx') {
+    // 该任务执行期才解析 build/resources/main/plugin.yaml（见 notCompatibleWithConfigurationCache），
+    // Gradle 推断不出对 processResources 的依赖；不显式声明的话，clean build 时会先跑它而报
+    // FileNotFoundException（CI 必现）。
+    dependsOn tasks.named('processResources')
     notCompatibleWithConfigurationCache('This task invokes "Task.project" at execution time, which is not supported with configuration cache.')
 }
 
