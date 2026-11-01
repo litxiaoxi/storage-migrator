@@ -16,7 +16,7 @@ export default definePlugin({
           searchable: true,
           menu: {
             name: '存储策略迁移',
-            group: '工具',
+            group: 'tool',
             icon: markRaw(IconPlug),
             priority: 0,
           },
