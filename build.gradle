@@ -1,0 +1,76 @@
+plugins {
+    id 'java'
+    id "run.halo.plugin.devtools" version "0.9.0"
+}
+
+group 'cn.litx.storagemigrator'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation platform('run.halo.tools.platform:plugin:2.27.0')
+    compileOnly 'run.halo.app:api'
+    // 用于从源存储策略抓取文件流（permalink 是公开地址，走 WebClient 拉取最通用）
+    compileOnly 'org.springframework:spring-webflux'
+
+    testImplementation 'run.halo.app:api'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    // 项目路径含中文时，测试工作进程需与 Gradle 守护进程保持一致的 UTF-8 编码，
+    // 否则 Gradle 传递的 classpath 会被按 GBK 解码，导致 ClassNotFoundException。
+    jvmArgs '-Dfile.encoding=UTF-8'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+    options.release = 21
+}
+
+tasks.named('generatePluginComponentsIdx') {
+    notCompatibleWithConfigurationCache('This task invokes "Task.project" at execution time, which is not supported with configuration cache.')
+}
+
+// development 模式直接从 build/classes 加载插件，组件索引必须一并落到 classpath，
+// 否则 Halo 找不到 @Component（自定义 API 端点不会注册）。
+tasks.register('copyComponentsIdx', Copy) {
+    from layout.buildDirectory.dir('tmp/META-INF')
+    into layout.buildDirectory.dir('classes/java/main/META-INF')
+    dependsOn tasks.named('generatePluginComponentsIdx')
+}
+
+halo {
+    version = '2.27'
+}
+
+// 用 Sync 而不是 Copy：vite 每次产出带新 hash 的文件名，Copy 会把历史产物一直留在
+// resources/main/ui 里，最终全被塞进 jar（实测攒了 14 份 main.<hash>.js）。
+tasks.register('processUiResources', Sync) {
+    from project(':ui').layout.buildDirectory.dir('dist')
+    // Halo 只识别固定名 ui/main.js 作为插件前端入口，
+    // 而 vite 产出的是带 hash 的 main.<hash>.js，这里额外复制一份固定名。
+    from(project(':ui').layout.buildDirectory.dir('dist')) {
+        include 'main.*.js'
+        exclude 'main.js'
+        rename { 'main.js' }
+    }
+    into layout.buildDirectory.dir('resources/main/ui')
+    dependsOn project(':ui').tasks.named('assemble')
+    shouldRunAfter tasks.named('processResources')
+}
+
+tasks.named('classes') {
+    dependsOn tasks.named('processUiResources')
+    dependsOn tasks.named('copyComponentsIdx')
+}

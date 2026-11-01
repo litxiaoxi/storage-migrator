@@ -1,0 +1,21 @@
+apiVersion: plugin.halo.run/v1alpha1
+kind: Plugin
+metadata:
+  name: storage-migrator
+spec:
+  enabled: true
+  version: 1.0.0
+  requires: ">=2.27.0"
+  author:
+    name: Litx
+    website: https://litx.cn
+    email: x@litx.cn
+  logo: logo.png
+  homepage: https://github.com/litxiaoxi/storage-migrator#readme
+  repo: https://github.com/litxiaoxi/storage-migrator
+  issues: https://github.com/litxiaoxi/storage-migrator/issues
+  displayName: "存储策略迁移"
+  description: "把一个存储策略下的附件搬运到另一个存储策略，并自动改写文章、独立页面、瞬间、用户头像、主题配置与系统设置中引用旧地址的链接。"
+  license:
+    - name: "GPL-3.0"
+      url: "https://github.com/litxiaoxi/storage-migrator/blob/main/LICENSE"
