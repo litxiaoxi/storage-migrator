@@ -46,6 +46,18 @@ tasks.named('generatePluginComponentsIdx') {
     notCompatibleWithConfigurationCache('This task invokes "Task.project" at execution time, which is not supported with configuration cache.')
 }
 
+// 打包时排除编辑器备份文件与本地临时文件。
+// 这些文件常被留在 src/main/resources 下（如 logo.png.bak），processResources 会原样拷进 jar，
+// 违反 Halo 应用市场审核指南 4.3.5「打包了无关的大文件」。注意 .gitignore 拦不住它们：
+// 未跟踪的文件依然存在于工作区，本地构建照样会被打进去。
+tasks.named('processResources', ProcessResources) {
+    exclude '**/*.bak'
+    exclude '**/*.orig'
+    exclude '**/*.rej'
+    exclude '**/*~'
+    exclude '**/.DS_Store'
+}
+
 // development 模式直接从 build/classes 加载插件，组件索引必须一并落到 classpath，
 // 否则 Halo 找不到 @Component（自定义 API 端点不会注册）。
 tasks.register('copyComponentsIdx', Copy) {
