@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.buffer.DataBuffer;
@@ -33,8 +34,11 @@ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.Disposable;
+import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 import reactor.core.scheduler.Schedulers;
 import run.halo.app.core.extension.User;
 import run.halo.app.core.extension.attachment.Attachment;
@@ -50,7 +54,7 @@ import run.halo.app.infra.ExternalUrlSupplier;
  * 再以目标策略重新上传，从而生成一条归属新策略的附件记录；移动模式下再删除旧记录。</p>
  */
 @Component
-public class MigrationService {
+public class MigrationService implements DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(MigrationService.class);
 
@@ -58,6 +62,13 @@ public class MigrationService {
     /** 临时文件读取缓冲（阶段二上传的字节源）。 */
     private static final int READ_BUFFER_SIZE = 8192;
     private static final MediaType FALLBACK_MEDIA_TYPE = MediaType.APPLICATION_OCTET_STREAM;
+    /**
+     * 插件停用时，等待进行中的任务跑完收尾（头像绑定修复）的时间上限。
+     *
+     * <p>超时会强制中断订阅，代价是移动模式下最后一批头像的绑定注解可能来不及修正，
+     * 所以不能设得太短。</p>
+     */
+    private static final long SHUTDOWN_GRACE_MILLIS = 5000L;
 
     /** 用户头像相关的注解：当前绑定的附件名、以及上一个（待清理）的附件名。 */
     private static final List<String> AVATAR_ANNOTATIONS = List.of(
@@ -91,6 +102,15 @@ public class MigrationService {
      * 所以同一组合同时只允许一个任务。</p>
      */
     private final Set<MigrationPair> activeMigrations = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 进行中任务的订阅句柄。
+     *
+     * <p>{@code runAsync} 用 {@code subscribe()} 启动后台任务时拿到的 {@link Disposable}，
+     * 持有它才能在插件停用时真正中断 Reactor 链 —— 只置取消标志位的话，
+     * 后台线程仍会继续跑完剩余文件（对应审核条款 2.3「禁用后留下继续运行的任务」）。</p>
+     */
+    private final Disposable.Composite runningSubscriptions = Disposables.composite();
 
     public MigrationService(ReactiveExtensionClient client,
                             AttachmentService attachmentService,
@@ -294,9 +314,26 @@ public class MigrationService {
     private void runAsync(MigrationTask task, SecurityContext securityContext, String requestBaseUrl) {
         task.setStatus(MigrationTask.Status.MIGRATING);
         var pair = new MigrationPair(task.getSourcePolicy(), task.getTargetPolicy());
-        run(task, requestBaseUrl)
+        // Swap 充当句柄中转：任务结束时能从 runningSubscriptions 里把自己摘掉，
+        // 避免容器随任务数无限增长（Composite 不支持按 key 移除）。
+        Disposable.Swap handle = Disposables.swap();
+        var subscription = run(task, requestBaseUrl)
             // 无论成功、失败还是被取消，都要放掉这一对策略，否则后续迁移会被永远挡住
-            .doFinally(signal -> activeMigrations.remove(pair))
+            .doFinally(signal -> {
+                activeMigrations.remove(pair);
+                runningSubscriptions.remove(handle);
+                // 收尾状态统一在这里落：run() 链尾的 Mono 在被 dispose() 强制中断时不会执行，
+                // 若把状态判定放在链尾，任务会永远卡在 MIGRATING，前端也看不出它已经结束。
+                if (!task.isTerminal()) {
+                    if (task.isCancelRequested()) {
+                        task.finish(MigrationTask.Status.CANCELLED, "任务已取消，已迁移的附件保留");
+                    } else if (signal == SignalType.ON_ERROR) {
+                        task.finish(MigrationTask.Status.FAILED, "迁移中断");
+                    } else {
+                        task.finish(MigrationTask.Status.SUCCEEDED, null);
+                    }
+                }
+            })
             // 迁移在后台线程执行，需要显式把请求的认证信息带进 Reactor 上下文，
             // 否则 AttachmentService.upload 会抛 401。
             .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(
@@ -309,12 +346,77 @@ public class MigrationService {
                     log.error("迁移任务 {} 失败", task.getId(), e);
                     task.finish(MigrationTask.Status.FAILED,
                         e.getMessage() == null ? e.toString() : e.getMessage());
-                },
-                () -> {
-                    if (!task.isTerminal()) {
-                        task.finish(MigrationTask.Status.SUCCEEDED, null);
-                    }
                 });
+        // 若任务已结束（极快完成），doFinally 先于 add 执行，此时 handle 尚未入容器，
+        // 用 remove 兜底清理；Swap 已释放时 update 返回 false，订阅随即被释放。
+        if (!handle.update(subscription)) {
+            subscription.dispose();
+            return;
+        }
+        runningSubscriptions.add(handle);
+    }
+
+    /**
+     * 插件被禁用或卸载时清理：停掉所有后台迁移任务。
+     *
+     * <p>两条路径都会调用本方法，且本方法是幂等的：</p>
+     * <ol>
+     *   <li>{@code StorageMigratorPlugin.stop()}：pf4j 停用插件时必然调用，时机最早；</li>
+     *   <li>{@link #destroy()}：插件 Spring 上下文关闭时触发，兜底。</li>
+     * </ol>
+     *
+     * <p>要做两件事，缺一不可：</p>
+     * <ol>
+     *   <li>置取消标志：任务在当前文件边界停下，已迁移的附件保留、不回退（与手动取消同语义）；</li>
+     *   <li>中断订阅：真正停掉后台线程，否则标志位要等下一个文件边界才生效，
+     *       而插件上下文销毁后它持有的 Halo 资源已不可用。</li>
+     * </ol>
+     */
+    public void shutdown() {
+        int running = registry.runningCount();
+        int cancelled = registry.cancelAllRunning();
+        if (running > 0) {
+            log.info("[storage-migrator] 插件停用：{} 个任务进行中，已取消 {}", running, cancelled);
+        }
+        // 先给任务一点时间跑完收尾：移动模式下源附件已删，若此时强行中断，
+        // 头像绑定注解来不及改指向新附件，UserReconciler 会永远重试、头像永久失效。
+        awaitRunningTasksStopped(SHUTDOWN_GRACE_MILLIS);
+        // 中断后台订阅，释放插件上下文关闭后仍占用着的线程
+        runningSubscriptions.dispose();
+        // 放掉策略占位，避免插件重新启用后误报「已有迁移任务在执行中」
+        activeMigrations.clear();
+    }
+
+    @Override
+    public void destroy() {
+        shutdown();
+    }
+
+    /**
+     * 等待进行中的任务自行收尾。
+     *
+     * <p>收尾包含头像绑定修复，必须让它跑完，所以这里给一个有限的等待窗口；
+     * 超时后由 {@link #destroy()} 强制中断订阅兜底。</p>
+     *
+     * @param timeoutMillis 等待上限
+     */
+    private void awaitRunningTasksStopped(long timeoutMillis) {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (registry.runningCount() == 0) {
+                return;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (registry.runningCount() > 0) {
+            log.warn("[storage-migrator] 插件停用：{} 个迁移任务未在期限内收尾，将强制中断",
+                registry.runningCount());
+        }
     }
 
     private Mono<Void> run(MigrationTask task, String requestBaseUrl) {
@@ -334,12 +436,7 @@ public class MigrationService {
             // 头像必须单独处理：它的权威来源是 User 上的 avatar-attachment-name 注解（存附件名），
             // spec.avatar 只是 Halo 的 UserReconciler 按该附件反写出来的结果。
             // 取消场景也要跑：移动模式下已删源的头像若不改注解，reconciler 会永远重试、头像永久失效。
-            .then(Mono.defer(() -> remapAvatarBindings(task)))
-            .then(Mono.fromRunnable(() -> {
-                if (task.isCancelRequested()) {
-                    task.finish(MigrationTask.Status.CANCELLED, "任务已取消，已迁移的附件保留");
-                }
-            }));
+            .then(Mono.defer(() -> remapAvatarBindings(task)));
     }
 
     /**
